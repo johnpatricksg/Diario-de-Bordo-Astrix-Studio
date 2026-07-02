@@ -985,7 +985,6 @@ function parseVendaValor(v) {
   if (v == null || v === '') return 0;
   if (typeof v === 'number') return v;
   let s = String(v).trim().replace('R$', '').trim();
-  // Se tem vírgula, assume formato BR (milhar '.', decimal ',')
   if (s.includes(',')) {
     s = s.replace(/\./g, '').replace(',', '.');
   }
@@ -993,39 +992,86 @@ function parseVendaValor(v) {
   return isNaN(n) ? 0 : n;
 }
 
-// Converte data (string, número serial do Excel ou Date) para 'YYYY-MM-DD'
-function parseVendaData(v) {
-  let d;
-  if (v instanceof Date) {
-    d = v;
-  } else if (typeof v === 'number') {
-    // número serial do Excel (dias desde 1899-12-30)
-    d = new Date(Math.round((v - 25569) * 86400 * 1000));
-  } else if (typeof v === 'string' && v.trim()) {
-    d = new Date(v);
-  } else {
-    return null;
-  }
-  if (isNaN(d.getTime())) return null;
+function isoFromDate(d) {
   const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), day = String(d.getDate()).padStart(2,'0');
   return `${y}-${m}-${day}`;
 }
 
-// Lê o workbook XLSX e extrai as linhas da aba "Vendas" (bloco esquerdo: Lead/Mês/Data/Serviço/.../Valor Total)
+const MESES_PT = {
+  'janeiro':1,'fevereiro':2,'março':3,'marco':3,'abril':4,'maio':5,'junho':6,
+  'julho':7,'agosto':8,'setembro':9,'outubro':10,'novembro':11,'dezembro':12
+};
+
+// Encontra o índice da primeira coluna cujo cabeçalho bate com um dos padrões
+function findColIndex(headerRow, patterns) {
+  for (let i = 0; i < headerRow.length; i++) {
+    const h = String(headerRow[i] || '').trim().toLowerCase();
+    if (patterns.some(p => p.test(h))) return i;
+  }
+  return -1;
+}
+
+// Converte a célula de data para 'YYYY-MM-DD', lidando com 3 formatos possíveis:
+// 1) Data completa (objeto Date do Excel)
+// 2) Número serial do Excel (data completa armazenada como número)
+// 3) Apenas o dia do mês (número pequeno, 1-31), combinado com uma coluna "Mês" separada (nome em português)
+function parseVendaData(rawData, mesNomeRaw) {
+  if (rawData instanceof Date) return isoFromDate(rawData);
+
+  if (typeof rawData === 'number') {
+    if (rawData > 1000) {
+      // número serial do Excel = data completa
+      return isoFromDate(new Date(Math.round((rawData - 25569) * 86400 * 1000)));
+    }
+    // número pequeno = apenas o dia do mês; precisa combinar com coluna "Mês"
+    const mesNome = String(mesNomeRaw || '').trim().toLowerCase();
+    const mesNum = MESES_PT[mesNome];
+    if (mesNum) {
+      const ano = new Date().getFullYear();
+      const dia = Math.round(rawData);
+      return `${ano}-${String(mesNum).padStart(2,'0')}-${String(dia).padStart(2,'0')}`;
+    }
+    return null;
+  }
+
+  if (typeof rawData === 'string' && rawData.trim()) {
+    const parsed = new Date(rawData);
+    if (!isNaN(parsed.getTime())) return isoFromDate(parsed);
+  }
+
+  return null;
+}
+
+// Lê o workbook XLSX e extrai as vendas da aba "Vendas", detectando colunas pelo cabeçalho
+// (funciona com diferentes layouts de planilha, não depende de posição fixa de coluna)
 function parseVendasXLSX(arrayBuffer) {
   const wb = XLSX.read(arrayBuffer, { type: 'array', cellDates: true });
   const sheetName = wb.SheetNames.find(n => n.trim().toLowerCase() === 'vendas') || wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: null });
+  if (!rows.length) return [];
 
-  // Linha 0 = título mesclado, linha 1 = cabeçalhos reais (Lead, Mês, Data, Serviço, ..., Valor Total)
+  // Encontra a linha de cabeçalho real procurando por "valor total" nas primeiras linhas
+  let headerRowIdx = 1;
+  for (let i = 0; i < Math.min(rows.length, 5); i++) {
+    const rowStr = (rows[i] || []).map(c => String(c||'').toLowerCase()).join('|');
+    if (rowStr.includes('valor total')) { headerRowIdx = i; break; }
+  }
+  const header = rows[headerRowIdx] || [];
+
+  const idxValor = findColIndex(header, [/valor\s*total/]);
+  const idxData = findColIndex(header, [/^data$/]);
+  const idxMes = findColIndex(header, [/^m[eê]s$/]);
+
+  if (idxValor === -1 || idxData === -1) return []; // layout não reconhecido
+
   const vendas = [];
-  for (let i = 2; i < rows.length; i++) {
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
     const row = rows[i];
     if (!row) continue;
-    const data = parseVendaData(row[2]);   // coluna C = Data
-    const valor = parseVendaValor(row[6]); // coluna G = Valor Total
-    if (data) vendas.push({ data, valor });
+    const data = parseVendaData(row[idxData], idxMes !== -1 ? row[idxMes] : null);
+    const valor = parseVendaValor(row[idxValor]);
+    if (data && valor > 0) vendas.push({ data, valor });
   }
   return vendas;
 }
